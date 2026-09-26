@@ -33,3 +33,15 @@ class Chunk(BaseModel):
             "file_metadata": self.file_metadata,
         }
         return d
+
+class EmbeddedChunk(BaseModel):
+    """A `Chunk` paired with its resulting dense vector embedding."""
+
+    chunk: Chunk
+    embedding: list[float]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chunk": self.chunk.to_dict(),
+            "embedding": self.embedding,
+        }

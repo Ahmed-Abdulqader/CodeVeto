@@ -1,2 +1,3 @@
-def main() -> None:
-    print("Hello from codeveto!")
+from codeveto.main import main
+
+__all__ = ["main"]

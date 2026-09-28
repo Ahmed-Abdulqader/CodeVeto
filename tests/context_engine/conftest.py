@@ -57,6 +57,19 @@ fn say_hello(name: &str) -> String {
 """
 
 
+@pytest.fixture(autouse=True)
+def isolated_codeveto_home(tmp_path_factory, monkeypatch):
+    """Every test gets its own empty CODEVETO_HOME, so no test reads or
+    writes the real ~/.codeveto, and no test's behavior depends on
+    whether the embedding model happens to already be installed on
+    whatever machine the suite runs on. `EmbeddingSettings` now defaults
+    to `provider="local_onnx"`, which looks here -- without this, the
+    engine fixture below would behave differently on a machine that has
+    the model installed than on one that doesn't."""
+    fake_home = tmp_path_factory.mktemp("codeveto_home")
+    monkeypatch.setenv("CODEVETO_HOME", str(fake_home))
+
+
 @pytest.fixture
 def sample_repo(tmp_path: Path) -> Path:
     (tmp_path / "greeter.py").write_text(PYTHON_SAMPLE)

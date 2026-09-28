@@ -51,9 +51,15 @@ class TestContextEngineIntegration:
         assert result["ok"] is True
         assert any("farewell" in (r["signature"] or "") for r in result["results"])
 
-    def test_engine_works_with_embedding_disabled_by_default(self, sample_repo: Path):
+    def test_engine_runs_lexical_only_when_no_model_is_installed(
+        self, sample_repo: Path
+    ):
+        """With the isolated CODEVETO_HOME (see conftest.py), no embedding
+        model is installed, so even though EmbeddingSettings defaults to
+        "local_onnx", the engine should quietly fall back to lexical-only
+        rather than fail to start."""
         config = EngineConfig(project_root=sample_repo)
-        assert config.embedding.provider == "none"
+        assert config.embedding.provider == "local_onnx"
         with ContextEngine(config) as engine:
             engine.index(force=True)
             result = engine.tools.search_context("say hello")

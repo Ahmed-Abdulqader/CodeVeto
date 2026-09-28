@@ -4,10 +4,8 @@ import pytest
 
 from context_engine.search.embedding import (
     EmbeddingProviderError,
-    FallbackEmbeddingProvider,
     LocalOnnxEmbeddingProvider,
     NullEmbeddingProvider,
-    RemoteEmbeddingProvider,
 )
 from context_engine.search.hybrid import ContextSearch
 from context_engine.search.lexical import LexicalIndex
@@ -75,48 +73,6 @@ class TestEmbeddingProviders:
         provider = NullEmbeddingProvider()
         with pytest.raises(EmbeddingProviderError):
             provider.embed_query("hello")
-
-    def test_remote_provider_requires_api_key_env(self, monkeypatch):
-        monkeypatch.delenv("MISSING_KEY", raising=False)
-        provider = RemoteEmbeddingProvider(
-            base_url="https://example.invalid", model="m", api_key_env="MISSING_KEY"
-        )
-        with pytest.raises(EmbeddingProviderError, match="MISSING_KEY"):
-            provider.embed_query("hello")
-
-    def test_fallback_tries_next_provider_on_failure(self):
-        class AlwaysFails:
-            def embed_query(self, text):
-                raise EmbeddingProviderError("nope")
-
-            def embed_documents(self, texts):
-                raise EmbeddingProviderError("nope")
-
-        class Succeeds:
-            def embed_query(self, text):
-                return [0.1, 0.2]
-
-            def embed_documents(self, texts):
-                return [[0.1, 0.2] for _ in texts]
-
-        provider = FallbackEmbeddingProvider([AlwaysFails(), Succeeds()])
-        assert provider.embed_query("hello") == [0.1, 0.2]
-
-    def test_fallback_raises_when_everything_fails(self):
-        class AlwaysFails:
-            def embed_query(self, text):
-                raise EmbeddingProviderError("nope")
-
-            def embed_documents(self, texts):
-                raise EmbeddingProviderError("nope")
-
-        provider = FallbackEmbeddingProvider([AlwaysFails(), AlwaysFails()])
-        with pytest.raises(EmbeddingProviderError):
-            provider.embed_query("hello")
-
-    def test_fallback_requires_at_least_one_provider(self):
-        with pytest.raises(ValueError):
-            FallbackEmbeddingProvider([])
 
 
 class TestContextSearch:
@@ -341,3 +297,31 @@ class TestLocalOnnxEmbeddingProvider:
         assert "token_type_ids" not in provider._input_names
         vector = provider.embed_query("hash")
         assert len(vector) == 4
+
+
+class TestFromGlobalInstall:
+    def test_raises_embedding_provider_error_when_not_installed(
+        self, tmp_path, monkeypatch
+    ):
+        # CODEVETO_HOME override so this never touches the real ~/.codeveto
+        monkeypatch.setenv("CODEVETO_HOME", str(tmp_path / "codeveto_home"))
+        with pytest.raises(EmbeddingProviderError, match="not found"):
+            LocalOnnxEmbeddingProvider.from_global_install()
+
+    def test_works_once_files_are_in_the_global_dir(
+        self, tmp_path, monkeypatch, onnx_embedding_model
+    ):
+        pytest.importorskip("onnxruntime")
+        from context_engine.paths import jina_code_model_dir
+
+        monkeypatch.setenv("CODEVETO_HOME", str(tmp_path / "codeveto_home"))
+        model_path, tokenizer_path = onnx_embedding_model
+
+        target_dir = jina_code_model_dir()
+        target_dir.mkdir(parents=True)
+        (target_dir / "model_quantized.onnx").write_bytes(model_path.read_bytes())
+        (target_dir / "tokenizer.json").write_bytes(tokenizer_path.read_bytes())
+
+        provider = LocalOnnxEmbeddingProvider.from_global_install(max_length=16)
+        vector = provider.embed_query("hash password")
+        assert len(vector) == 8

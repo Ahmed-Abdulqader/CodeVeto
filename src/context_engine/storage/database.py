@@ -17,18 +17,26 @@ _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
 class Database:
-    """A single SQLite connection, schema applied on first use.
+    """A single SQLite connection, schema applied on first use, shared
+    safely across threads.
 
-    SQLite connections aren't thread-safe by default; `check_same_thread`
-    is left at its default (True) deliberately. If CodeVeto later needs to
-    call the engine from multiple threads, share one `ContextEngine`
-    instance guarded by `Database.lock`, rather than loosening this.
+    `check_same_thread=False` plus the `threading.Lock` below is the
+    standard safe pattern for one sqlite3 connection used from more than
+    one thread: the lock serializes every actual access, so there's no
+    concurrent use of the connection, just use from different threads over
+    time. This matters here specifically because pydantic-ai runs
+    synchronous tool functions (search_context, record_decision, ...) in
+    a worker-thread pool by default, not the thread that constructed the
+    `ContextEngine` -- with `check_same_thread` at its default (True),
+    every tool call raised `sqlite3.ProgrammingError`. Found this by
+    actually running an agent end to end against a real engine, not by
+    reasoning about it in the abstract.
     """
 
     def __init__(self, db_path: str | Path) -> None:
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")

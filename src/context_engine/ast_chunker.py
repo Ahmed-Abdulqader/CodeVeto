@@ -1,112 +1,148 @@
+"""Turns Python source into the chunks CodeVeto's tools work with.
+
+Only what the agent actually sees is extracted:
+
+* module-level imports            -> code + line range
+* other module-level statements   -> code + line range
+* classes / functions / methods   -> code + line range + signature + docstring
+
+Every chunk is a whole-line span, so the line range stored with a chunk is
+exactly what `write_code_chunk` needs to replace it later.
+"""
+
 import ast
+import copy
 import hashlib
 import os
-import textwrap
+
+
+def normalize_path(file_path: str) -> str:
+    """The one place that decides how a path is stored in / looked up in the index."""
+    return os.path.realpath(file_path)
+
+
+def content_hash(source: str) -> str:
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
 
 def get_file_data(file_path: str, source: str) -> dict:
     """Data for the `files` table."""
     return {
-        "file_path": os.path.abspath(file_path),
-        "file_name": os.path.basename(file_path),
-        "content_hash": hashlib.sha256(source.encode("utf-8")).hexdigest(),
-        "last_modified": os.path.getmtime(file_path),
+        "file_path": normalize_path(file_path),
+        "content_hash": content_hash(source),
     }
+
+
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
+def _first_line(node: ast.AST) -> int:
+    """First line of a definition, *including* its decorators.
+
+    `node.lineno` of a decorated function/class is the `def`/`class` line, so
+    using it alone would silently leave the decorators out of the chunk.
+    """
+    decorators = getattr(node, "decorator_list", [])
+    return min([node.lineno, *(d.lineno for d in decorators)])
+
+
+def _dedent(lines: list[str]) -> str:
+    """Strip the first line's indentation from every line.
+
+    Lets a method read like a top-level function. Unlike `textwrap.dedent`,
+    lines that are indented less than the first one (e.g. the inside of a
+    multi-line string) are left untouched instead of cancelling the dedent.
+    """
+    first = lines[0]
+    prefix = first[: len(first) - len(first.lstrip())]
+    return "\n".join(
+        line[len(prefix):] if line.startswith(prefix) else line for line in lines
+    )
+
+
+def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> str:
+    """Decorators + the `def` / `class` line, with the body (and docstring) removed.
+
+    Built with `ast.unparse` on a body-less copy so async, defaults, annotations,
+    keyword-only args, base classes, metaclass keywords and generics all come out
+    right without hand-assembling the header.
+    """
+    clone = copy.copy(node)
+    clone.body = [ast.Pass()]
+    return ast.unparse(clone).rsplit("\n", 1)[0]
 
 
 class ASTVisitor(ast.NodeVisitor):
     def __init__(self, source: str):
         self.source = source
+        self._lines = source.split("\n")
+        self.imports = []
         self.classes = []
-        self.class_inheritance = []
         self.functions = []
         self.methods = []
-        self.imports = []
         # Scope stack: ("class", class_record) or ("function", None)
         self._scope_stack = []
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _get_code(self, node: ast.AST) -> str | None:
-        """Return the node's source text, dedented so nested defs (e.g. methods) read cleanly."""
-        segment = ast.get_source_segment(self.source, node, padded=True)
-        return textwrap.dedent(segment) if segment is not None else None
+    def _definition_span(self, node: ast.AST) -> tuple[int, int, str]:
+        """(start_line, end_line, code) of a class/function, decorators included."""
+        start, end = _first_line(node), node.end_lineno
+        return start, end, _dedent(self._lines[start - 1 : end])
 
     # ------------------------------------------------------------------
     # Getters: one per table
     # ------------------------------------------------------------------
+    def get_imports(self) -> list[dict]:
+        """`imports` table: module-level imports (start_line, end_line, code)."""
+        return self.imports
+
     def get_classes(self) -> list[dict]:
-        """`classes` table: name, docstring, start_line, end_line, decorators, code."""
+        """`classes` table: name, signature, docstring, start_line, end_line, code."""
         return self.classes
 
-    def get_class_inheritance(self) -> list[dict]:
-        """
-        `class_inheritance` table.
-        class_name + class_start_line identify the child class (used to find class_id on insert).
-        parent_class_id is None here; it is resolved in SQL after insertion.
-        """
-        return self.class_inheritance
-
     def get_functions(self) -> list[dict]:
-        """`functions` table: top-level functions only (includes code)."""
+        """`functions` table: top-level functions only."""
         return self.functions
 
     def get_methods(self) -> list[dict]:
-        """`methods` table (includes code). class_name + class_start_line identify the owning class."""
+        """`methods` table. class_name + class_start_line identify the owning class."""
         return self.methods
-
-    def get_imports(self) -> list[dict]:
-        """`imports` table (target_file_id is None until resolved)."""
-        return self.imports
 
     # ------------------------------------------------------------------
     # Imports
     # ------------------------------------------------------------------
-    def visit_Import(self, node: ast.Import):
-        for alias in node.names:
-            self.imports.append({
-                "import_type": "import",
-                "module_name": alias.name,
-                "imported_name": None,
-                "alias": alias.asname,
-                "target_file_id": None,
-                "line_number": node.lineno,
-            })
-
-    def visit_ImportFrom(self, node: ast.ImportFrom):
-        # Keep the dots for relative imports: `from ..pkg import x` -> "..pkg"
-        module_name = "." * node.level + (node.module or "")
-        for alias in node.names:
-            self.imports.append({
-                "import_type": "import_from",
-                "module_name": module_name,
-                "imported_name": alias.name,
-                "alias": alias.asname,
-                "target_file_id": None,
-                "line_number": node.lineno,
-            })
+    def visit_Module(self, node: ast.Module):
+        # Only module-level imports are kept. An import inside a function is
+        # already part of that function's code, and one inside a top-level
+        # `try:` / `if TYPE_CHECKING:` is part of that top-level chunk.
+        for stmt in node.body:
+            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                self.imports.append(
+                    {
+                        "start_line": stmt.lineno,
+                        "end_line": stmt.end_lineno,
+                        "code": ast.get_source_segment(self.source, stmt)
+                        or ast.unparse(stmt),
+                    }
+                )
+        self.generic_visit(node)
 
     # ------------------------------------------------------------------
     # Classes
     # ------------------------------------------------------------------
     def visit_ClassDef(self, node: ast.ClassDef):
+        start, end, code = self._definition_span(node)
         class_record = {
             "name": node.name,
+            "signature": _signature(node),
             "docstring": ast.get_docstring(node),
-            "start_line": node.lineno,
-            "end_line": node.end_lineno,
-            "decorators": [ast.unparse(d) for d in node.decorator_list],
-            "code": self._get_code(node),
+            "start_line": start,
+            "end_line": end,
+            "code": code,
         }
         self.classes.append(class_record)
-
-        for base in node.bases:
-            self.class_inheritance.append({
-                "class_name": node.name,
-                "class_start_line": node.lineno,
-                "parent_class_name": ast.unparse(base),
-                "parent_class_id": None,
-            })
 
         self._scope_stack.append(("class", class_record))
         self.generic_visit(node)
@@ -116,82 +152,55 @@ class ASTVisitor(ast.NodeVisitor):
     # Functions / methods
     # ------------------------------------------------------------------
     def visit_FunctionDef(self, node: ast.FunctionDef):
-        self._process_function(node, is_async=False)
+        self._process_function(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-        self._process_function(node, is_async=True)
+        self._process_function(node)
 
-    def _process_function(self, node: ast.AST, is_async: bool):
-        scope_kind, scope_record = self._scope_stack[-1] if self._scope_stack else (None, None)
+    def _process_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
+        scope_kind, scope_record = (
+            self._scope_stack[-1] if self._scope_stack else (None, None)
+        )
 
         if scope_kind is None:
             # top-level function
-            self.functions.append(self._record_function(node, is_async))
+            self.functions.append(self._record_function(node))
         elif scope_kind == "class":
             # direct method of a class
-            method = self._record_function(node, is_async)
+            method = self._record_function(node)
             method["class_name"] = scope_record["name"]
             method["class_start_line"] = scope_record["start_line"]
             self.methods.append(method)
-        # scope_kind == "function": nested function -> not recorded as its own row
-        # (its calls are still counted in the parent via ast.walk)
+        # scope_kind == "function": nested function -> not recorded as its own
+        # row (it is part of the enclosing function's code)
 
         self._scope_stack.append(("function", None))
         self.generic_visit(node)
         self._scope_stack.pop()
 
-    def get_call_name(self, node_func: ast.AST) -> str:
-        if isinstance(node_func, ast.Name):
-            return node_func.id
-        elif isinstance(node_func, ast.Attribute):
-            return node_func.attr
-
-        try:
-            return ast.unparse(node_func)
-        except AttributeError:
-            return "Unknown"
-
-    def _record_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef, is_async: bool) -> dict:
-        def _extract_arg_info(arg_node: ast.arg, prefix: str = "") -> dict:
-            return {
-                "name": f"{prefix}{arg_node.arg}",
-                "type": ast.unparse(arg_node.annotation) if arg_node.annotation else None
-            }
-
-        args = []
-        args.extend([_extract_arg_info(arg) for arg in node.args.posonlyargs])
-        args.extend([_extract_arg_info(arg) for arg in node.args.args])
-
-        if node.args.vararg:
-            args.append(_extract_arg_info(node.args.vararg, prefix="*"))
-
-        args.extend([_extract_arg_info(arg) for arg in node.args.kwonlyargs])
-
-        if node.args.kwarg:
-            args.append(_extract_arg_info(node.args.kwarg, prefix="**"))
-
-        calls = [
-            self.get_call_name(child.func)
-            for child in ast.walk(node)
-            if isinstance(child, ast.Call)
-        ]
-
+    def _record_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict:
+        start, end, code = self._definition_span(node)
         return {
-            "type": "async_function" if is_async else "function",
             "name": node.name,
+            "signature": _signature(node),
             "docstring": ast.get_docstring(node),
-            "returns": ast.unparse(node.returns) if node.returns else None,
-            "start_line": node.lineno,
-            "end_line": node.end_lineno,
-            "start_column": node.col_offset,
-            "end_column": node.end_col_offset,
-            "args": args,
-            "calls": calls,
-            "decorators": [ast.unparse(d) for d in node.decorator_list],
-            "code": self._get_code(node),
+            "start_line": start,
+            "end_line": end,
+            "code": code,
         }
 
+
 class TopLevelCodeVisitor(ast.NodeVisitor):
+    """Module-level statements that are not an import, a function or a class."""
+
+    _SKIPPED = (
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.Import,
+        ast.ImportFrom,
+    )
+
     def __init__(self, source_code: str):
         self.source_code = source_code
         self.chunks: list[dict] = []
@@ -199,80 +208,19 @@ class TopLevelCodeVisitor(ast.NodeVisitor):
     def visit_Module(self, node: ast.Module) -> None:
         """Iterates over top-level statements in the file body."""
         for stmt in node.body:
-            # 1. Skip functions, async functions, and classes
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # Functions/classes and imports are stored in their own tables.
+            if isinstance(stmt, self._SKIPPED):
                 continue
 
-            # 2. Skip imports (since you already extract them elsewhere)
-            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-                continue
-
-            # 3. Extract source text and metadata
-            segment = ast.get_source_segment(self.source_code, stmt)
-
-            self.chunks.append({
-                "category": self._categorize_statement(stmt),
-                "node_type": type(stmt).__name__,
-                "start_line": stmt.lineno,
-                "end_line": stmt.end_lineno,
-                "code": segment
-            })
-
-    def _categorize_statement(self, stmt: ast.stmt) -> str:
-        """Categorizes top-level code chunks."""
-        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
-            return "constant_or_global"
-        elif isinstance(stmt, ast.If):
-            if self._is_main_block(stmt):
-                return "main_guard"
-            return "top_level_conditional"
-        elif isinstance(stmt, ast.Expr):
-            return "top_level_expression"
-        elif isinstance(stmt, (ast.Try, ast.With)):
-            return "top_level_setup"
-        return "other_top_level_code"
-
-    def _is_main_block(self, node: ast.If) -> bool:
-        """Checks if the statement is `if __name__ == '__main__':`."""
-        test = node.test
-        if isinstance(test, ast.Compare):
-            left_is_name = isinstance(test.left, ast.Name) and test.left.id == "__name__"
-            right_is_main = any(
-                isinstance(comp, ast.Constant) and comp.value == "__main__"
-                for comp in test.comparators
+            self.chunks.append(
+                {
+                    "start_line": stmt.lineno,
+                    "end_line": stmt.end_lineno,
+                    "code": ast.get_source_segment(self.source_code, stmt)
+                    or ast.unparse(stmt),
+                }
             )
-            return left_is_name and right_is_main
-        return False
+
     def get_chunks(self) -> list[dict]:
-        """`top_level_chunks` table: category, node_type, start_line, end_line, code."""
+        """`top_level_chunks` table: start_line, end_line, code."""
         return self.chunks
-
-    # Prevent visiting children inside functions or classes
-    def visit_FunctionDef(self, node): pass
-    def visit_AsyncFunctionDef(self, node): pass
-    def visit_ClassDef(self, node): pass
-
-
-if __name__=="__main__":
-    with open("test_chunker.py", "rb") as f:
-        code = f.read()
-    code_str = code.decode("utf-8")
-    tree = ast.parse(code)
-
-    extractor = ASTVisitor()
-    extractor.visit(tree)
-    for importer in extractor.imports:
-        print(importer)
-    for import_from in extractor.import_from:
-        print(import_from)
-
-    for record in extractor.records:
-        print(record)
-
-    tree = ast.parse(code_str)
-    visitor = TopLevelCodeVisitor(code_str)
-    visitor.visit(tree)
-
-    # 3. Access chunks (list of dicts)
-    chunks = visitor.chunks
-    print(chunks)

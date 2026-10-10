@@ -1,22 +1,107 @@
-import json
+"""Read-only queries over the code index, rendered as Markdown for the AI agent.
+
+Every public function returns a Markdown string:
+  - success: code in fenced blocks, with a short header per item
+  - failure / nothing found: a plain sentence ("**Error:** ..." for errors)
+
+Nothing here returns JSON.
+"""
+
+import functools
 import os
+import re
 import sqlite3
+import textwrap
 from collections import defaultdict
 
+from context_engine.ast_chunker import normalize_path
 from models.chunking_models import (
-    ClassWithParents,
-    FileOut,
-    FunctionOut,
-    ImportOut,
-    MethodOut,
-    ParentRef,
-    TopLevelChunkOut,
+    ClassOut,
+    Definition,
+    FunctionsAndMethods,
+    Imports,
+    TopLevelChunks,
 )
-from context_engine.config import DATABASE_PATH
 
 
 # ----------------------------------------------------------------------
-# Helpers
+# Token counting (only used to pick the cheaper of two renderings)
+# ----------------------------------------------------------------------
+@functools.lru_cache(maxsize=1)
+def _encoder():
+    try:
+        import tiktoken
+
+        return tiktoken.get_encoding("o200k_base")
+    except Exception:  # not installed, or its vocabulary can't be downloaded offline
+        return None
+
+
+def count_tokens(text: str) -> int:
+    """Token count of `text`; falls back to ~4 characters per token."""
+    encoder = _encoder()
+    if encoder is None:
+        return len(text) // 4 + 1
+    return len(encoder.encode(text))
+
+
+# ----------------------------------------------------------------------
+# Markdown helpers
+# ----------------------------------------------------------------------
+def error(message: str) -> str:
+    return f"**Error:** {message}"
+
+
+def _fence(code: str, lang: str = "python") -> str:
+    """Fenced code block, with a fence long enough to survive backticks in `code`."""
+    longest = max((len(run) for run in re.findall(r"`+", code)), default=0)
+    ticks = "`" * max(3, longest + 1)
+    return f"{ticks}{lang}\n{code}\n{ticks}"
+
+
+def _lines_label(start: int, end: int) -> str:
+    return f"line {start}" if start == end else f"lines {start}-{end}"
+
+
+def _names(names: list[str], limit: int = 30) -> str:
+    unique = list(dict.fromkeys(names))
+    shown = ", ".join(f"`{n}`" for n in unique[:limit])
+    if len(unique) > limit:
+        shown += f" (and {len(unique) - limit} more)"
+    return shown
+
+
+def _heading(kind: str, label: str, d: Definition) -> str:
+    return f"### {kind} `{label}` ({_lines_label(d.start_line, d.end_line)})"
+
+
+def _outline(d: Definition) -> str:
+    """Signature + docstring, with the body elided."""
+    lines = [d.signature]
+    if d.docstring:
+        lines.append(textwrap.indent(f'"""{d.docstring}"""', "    "))
+    lines.append("    ...")
+    return "\n".join(lines)
+
+
+def _item(heading: str, outline: str, code: str) -> str:
+    """Render one definition as whichever form costs fewer tokens.
+
+    For big definitions that is the outline; for tiny ones the full source is
+    both shorter and more informative. A full-source item says so in its heading.
+    """
+    full = _fence(code)
+    if count_tokens(outline) < count_tokens(full):
+        return f"{heading}\n{outline}"
+    return f"{heading} — full source\n{full}"
+
+
+def _code_item(heading: str, d: Definition) -> str:
+    return f"{heading}\n{_fence(d.code)}"
+
+
+# ----------------------------------------------------------------------
+# DB helpers
 # ----------------------------------------------------------------------
 def _fetch(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict]:
     cur = conn.execute(sql, params)
@@ -24,188 +109,252 @@ def _fetch(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def _error(message: str) -> str:
-    return json.dumps({"error": message})
-
-
-def _dumps(models: list) -> str:
-    return json.dumps([m.model_dump() for m in models], indent=4)
-
-
 def _get_file_id(conn: sqlite3.Connection, file_path: str) -> int | None:
-    """
-    Look up a file's id. The saver stores os.path.abspath(file_path),
-    so normalize here too or relative paths will never match.
-    """
+    """The saver stores the normalized path, so normalize here too."""
     rows = _fetch(
         conn,
         "SELECT id FROM files WHERE file_path = ?",
-        (os.path.abspath(file_path),),
+        (normalize_path(file_path),),
     )
     return rows[0]["id"] if rows else None
 
 
 def _not_found(file_path: str) -> str:
-    return _error(f"File '{file_path}' was not found in the database")
+    return error(f"File `{file_path}` was not found in the index")
 
 
-# ----------------------------------------------------------------------
-# Queries. Every public function returns a JSON string:
-#   - success: a JSON object / list (an empty list means "none found")
-#   - failure: {"error": "..."}
-# ----------------------------------------------------------------------
-def get_file_info(conn: sqlite3.Connection, file_path: str) -> str:
+def _base(file_path: str) -> str:
+    return os.path.basename(file_path)
+
+
+_DEF_SELECT = "name, signature, docstring, start_line, end_line, code"
+
+
+def _classes(
+    conn: sqlite3.Connection, file_id: int, name: str | None = None
+) -> list[ClassOut]:
+    sql = f"SELECT id, {_DEF_SELECT} FROM classes WHERE file_id = ?"
+    params: tuple = (file_id,)
+    if name is not None:
+        sql += " AND name = ?"
+        params += (name,)
+    rows = _fetch(conn, sql + " ORDER BY start_line", params)
+    return [ClassOut.model_validate(r) for r in rows]
+
+
+def _functions(
+    conn: sqlite3.Connection, file_id: int, name: str | None = None
+) -> list[FunctionsAndMethods]:
+    sql = f"SELECT {_DEF_SELECT} FROM functions WHERE file_id = ?"
+    params: tuple = (file_id,)
+    if name is not None:
+        sql += " AND name = ?"
+        params += (name,)
+    rows = _fetch(conn, sql + " ORDER BY start_line", params)
+    return [FunctionsAndMethods.model_validate(r) for r in rows]
+
+
+def _methods(
+    conn: sqlite3.Connection, class_id: int, name: str | None = None
+) -> list[FunctionsAndMethods]:
+    sql = f"SELECT {_DEF_SELECT} FROM methods WHERE class_id = ?"
+    params: tuple = (class_id,)
+    if name is not None:
+        sql += " AND name = ?"
+        params += (name,)
+    rows = _fetch(conn, sql + " ORDER BY start_line", params)
+    return [FunctionsAndMethods.model_validate(r) for r in rows]
+
+
+def _method_names_by_class(
+    conn: sqlite3.Connection, file_id: int
+) -> dict[int, list[str]]:
     rows = _fetch(
         conn,
-        """
-        SELECT id, file_path, file_name, content_hash, last_modified
-        FROM files
-        WHERE file_path = ?
-        """,
-        (os.path.abspath(file_path),),
+        "SELECT class_id, name FROM methods WHERE file_id = ? ORDER BY start_line",
+        (file_id,),
     )
-    if not rows:
-        return _not_found(file_path)
+    names: dict[int, list[str]] = defaultdict(list)
+    for r in rows:
+        names[r["class_id"]].append(r["name"])
+    return names
 
-    return json.dumps(FileOut.model_validate(rows[0]).model_dump(), indent=4)
 
-# needs to be chaged to return only the code
+def _class_not_found(conn, file_id: int, file_path: str, class_name: str) -> str:
+    available = [c.name for c in _classes(conn, file_id)]
+    hint = (
+        f" Classes in this file: {_names(available)}."
+        if available
+        else " This file has no classes."
+    )
+    return error(f"Class `{class_name}` was not found in `{_base(file_path)}`.{hint}")
+
+
+# ----------------------------------------------------------------------
+# Queries
+# ----------------------------------------------------------------------
 def get_imports(conn: sqlite3.Connection, file_path: str) -> str:
+    """The module-level import statements of a file: code only."""
     file_id = _get_file_id(conn, file_path)
     if file_id is None:
         return _not_found(file_path)
 
     rows = _fetch(
         conn,
-        """
-        SELECT id, source_file_id, import_type, module_name, imported_name,
-               alias, target_file_id, line_number
-        FROM imports
-        WHERE source_file_id = ?
-        ORDER BY line_number
-        """,
+        "SELECT start_line, end_line, code FROM imports "
+        "WHERE file_id = ? ORDER BY start_line",
         (file_id,),
     )
-    return _dumps([ImportOut.model_validate(r) for r in rows])
+    if not rows:
+        return f"`{_base(file_path)}` has no module-level imports."
+    imports = [Imports.model_validate(r) for r in rows]
+    return _fence("\n".join(i.code for i in imports))
 
 
 def get_top_level_chunks(conn: sqlite3.Connection, file_path: str) -> str:
+    """Module-level code that is not an import, function or class: code only."""
     file_id = _get_file_id(conn, file_path)
     if file_id is None:
         return _not_found(file_path)
 
     rows = _fetch(
         conn,
-        """
-        SELECT id, file_id, category, node_type, start_line, end_line, code
-        FROM top_level_chunks
-        WHERE file_id = ?
-        ORDER BY start_line
-        """,
+        "SELECT start_line, end_line, code FROM top_level_chunks "
+        "WHERE file_id = ? ORDER BY start_line",
         (file_id,),
     )
-    return _dumps([TopLevelChunkOut.model_validate(r) for r in rows])
+    if not rows:
+        return f"`{_base(file_path)}` has no other module-level code."
+    chunks = [TopLevelChunks.model_validate(r) for r in rows]
+    return _fence("\n\n".join(c.code for c in chunks))
 
 
-# need to add a methods names that are in each clsses
 def get_classes(conn: sqlite3.Connection, file_path: str) -> str:
-    """All classes in a file, each with its list of parents."""
+    """Every class of a file: an outline (header, docstring, methods) or full code."""
     file_id = _get_file_id(conn, file_path)
     if file_id is None:
         return _not_found(file_path)
 
-    classes = _fetch(
-        conn,
-        """
-        SELECT id, name, docstring, start_line, end_line, decorators, code
-        FROM classes
-        WHERE file_id = ?
-        ORDER BY start_line
-        """,
-        (file_id,),
-    )
+    classes = _classes(conn, file_id)
     if not classes:
-        return json.dumps([])
+        return f"`{_base(file_path)}` has no classes."
 
-    # One query for every parent row in the file, grouped by child class id
-    parent_rows = _fetch(
-        conn,
-        """
-        SELECT ci.class_id, ci.parent_class_name, ci.parent_class_id
-        FROM class_inheritance ci
-        JOIN classes c ON c.id = ci.class_id
-        WHERE c.file_id = ?
-        """,
-        (file_id,),
-    )
-    parents_by_class: dict[int, list[dict]] = defaultdict(list)
-    for p in parent_rows:
-        parents_by_class[p["class_id"]].append(
-            ParentRef.model_validate(
-                {
-                    "parent_class_name": p["parent_class_name"],
-                    "parent_class_id": p["parent_class_id"],
-                }
-            ).model_dump()
-        )
-
-    result = [
-        ClassWithParents.model_validate(
-            {**cls, "parents": parents_by_class.get(cls["id"], [])}
-        )
-        for cls in classes
-    ]
-    return _dumps(result)
+    method_names = _method_names_by_class(conn, file_id)
+    parts = [f"## Classes in `{_base(file_path)}`"]
+    for cls in classes:
+        outline = _fence(_outline(cls))
+        names = method_names.get(cls.id, [])
+        if names:
+            outline += f"\nMethods: {_names(names)}"
+        parts.append(_item(_heading("class", cls.name, cls), outline, cls.code))
+    return "\n\n".join(parts)
 
 
 def get_functions(conn: sqlite3.Connection, file_path: str) -> str:
-    """Top-level functions of a file."""
+    """Every top-level function of a file: an outline or the full code."""
     file_id = _get_file_id(conn, file_path)
     if file_id is None:
         return _not_found(file_path)
 
-    rows = _fetch(
-        conn,
-        """
-        SELECT id, type, name, docstring, returns, start_line, end_line,
-               start_column, end_column, args, calls, decorators, code
-        FROM functions
-        WHERE file_id = ?
-        ORDER BY start_line
-        """,
-        (file_id,),
+    functions = _functions(conn, file_id)
+    if not functions:
+        return f"`{_base(file_path)}` has no top-level functions."
+
+    parts = [f"## Functions in `{_base(file_path)}`"]
+    for fn in functions:
+        parts.append(
+            _item(_heading("function", fn.name, fn), _fence(_outline(fn)), fn.code)
+        )
+    return "\n\n".join(parts)
+
+
+def get_class_methods(
+    conn: sqlite3.Connection, file_path: str, class_name: str
+) -> str:
+    """The methods of a class: outline (signature, docstring) or full source."""
+    file_id = _get_file_id(conn, file_path)
+    if file_id is None:
+        return _not_found(file_path)
+
+    classes = _classes(conn, file_id, class_name)
+    if not classes:
+        return _class_not_found(conn, file_id, file_path, class_name)
+
+    parts = []
+    for cls in classes:
+        label = _lines_label(cls.start_line, cls.end_line)
+        methods = _methods(conn, cls.id)
+        if not methods:
+            parts.append(f"Class `{cls.name}` ({label}) has no methods.")
+            continue
+        parts.append(f"## Methods of `{cls.name}` ({label})")
+        for m in methods:
+            heading = _heading("method", f"{cls.name}.{m.name}", m)
+            parts.append(_item(heading, _fence(_outline(m)), m.code))
+    return "\n\n".join(parts)
+
+
+def get_function_code(
+    conn: sqlite3.Connection, file_path: str, function_name: str
+) -> str:
+    """Full source of a top-level function (all definitions sharing that name)."""
+    file_id = _get_file_id(conn, file_path)
+    if file_id is None:
+        return _not_found(file_path)
+
+    functions = _functions(conn, file_id, function_name)
+    if not functions:
+        available = [f.name for f in _functions(conn, file_id)]
+        hint = (
+            f" Functions in this file: {_names(available)}."
+            if available
+            else " This file has no top-level functions."
+        )
+        return error(
+            f"Function `{function_name}` was not found in `{_base(file_path)}`.{hint}"
+        )
+    return "\n\n".join(
+        _code_item(_heading("function", f.name, f), f) for f in functions
     )
-    return _dumps([FunctionOut.model_validate(r) for r in rows])
 
 
-def get_methods(conn: sqlite3.Connection, class_id: int) -> str:
-    """Methods of one class (use the `id` returned by get_classes)."""
-    exists = _fetch(conn, "SELECT id FROM classes WHERE id = ?", (class_id,))
-    if not exists:
-        return _error(f"Class id {class_id} was not found in the database")
+def get_class_code(conn: sqlite3.Connection, file_path: str, class_name: str) -> str:
+    """Full source of a class, methods included."""
+    file_id = _get_file_id(conn, file_path)
+    if file_id is None:
+        return _not_found(file_path)
 
-    rows = _fetch(
-        conn,
-        """
-        SELECT id, class_id, file_id, type, name, docstring, returns,
-               start_line, end_line, start_column, end_column,
-               args, calls, decorators, code
-        FROM methods
-        WHERE class_id = ?
-        ORDER BY start_line
-        """,
-        (class_id,),
+    classes = _classes(conn, file_id, class_name)
+    if not classes:
+        return _class_not_found(conn, file_id, file_path, class_name)
+    return "\n\n".join(_code_item(_heading("class", c.name, c), c) for c in classes)
+
+
+def get_method_code(
+    conn: sqlite3.Connection, file_path: str, class_name: str, method_name: str
+) -> str:
+    """Full source of one method. Getter/setter pairs return every definition."""
+    file_id = _get_file_id(conn, file_path)
+    if file_id is None:
+        return _not_found(file_path)
+
+    classes = _classes(conn, file_id, class_name)
+    if not classes:
+        return _class_not_found(conn, file_id, file_path, class_name)
+
+    parts = []
+    for cls in classes:
+        parts.extend(
+            _code_item(_heading("method", f"{cls.name}.{m.name}", m), m)
+            for m in _methods(conn, cls.id, method_name)
+        )
+    if parts:
+        return "\n\n".join(parts)
+
+    available = [m.name for cls in classes for m in _methods(conn, cls.id)]
+    hint = (
+        f" Methods of this class: {_names(available)}."
+        if available
+        else " This class has no methods."
     )
-    return _dumps([MethodOut.model_validate(r) for r in rows])
-
-
-if __name__ == "__main__":
-    file_path = "/home/ahmed/projects/CodeVeto/minimal/CodeVeto/src/codeveto/test_chunker.py"
-
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        print(get_file_info(conn, file_path))
-        print(get_imports(conn, file_path))
-        print(get_top_level_chunks(conn, file_path))
-        print(get_classes(conn, file_path))
-        print(get_functions(conn, file_path))
-        print(get_methods(conn, 1))
+    return error(f"Method `{method_name}` was not found in class `{class_name}`.{hint}")

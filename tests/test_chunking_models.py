@@ -3,8 +3,8 @@ from pydantic import ValidationError
 
 from models import chunking_models
 from models.chunking_models import (
-    ClassOut,
     Classes,
+    ClassOut,
     FunctionsAndMethods,
     Imports,
     Methods,
@@ -27,7 +27,13 @@ def test_docstring_is_optional():
 def test_unknown_fields_are_ignored():
     # the old parser output (columns, calls, args, ...) must not break validation
     chunk = TopLevelChunks.model_validate(
-        {"start_line": 1, "end_line": 1, "code": "x = 1", "category": "constant", "node_type": "Assign"}
+        {
+            "start_line": 1,
+            "end_line": 1,
+            "code": "x = 1",
+            "category": "constant",
+            "node_type": "Assign",
+        }
     )
     assert not hasattr(chunk, "category")
     assert set(chunk.model_dump()) == {"start_line", "end_line", "code"}
@@ -44,7 +50,9 @@ def test_to_db_params_adds_file_id_and_extras():
     assert params["file_id"] == 7
     assert params["name"] == "f"
 
-    method = Methods.model_validate({**DEFINITION, "class_name": "C", "class_start_line": 1})
+    method = Methods.model_validate(
+        {**DEFINITION, "class_name": "C", "class_start_line": 1}
+    )
     assert method.to_db_params(7, class_id=3)["class_id"] == 3
 
 

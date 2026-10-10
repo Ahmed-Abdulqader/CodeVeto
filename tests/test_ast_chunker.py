@@ -70,7 +70,9 @@ def test_imports_are_module_level_statements_only(sample_source):
 
 def test_import_records_only_have_what_the_agent_uses(sample_source):
     visitor, _ = visit(sample_source)
-    assert all(set(i) == {"start_line", "end_line", "code"} for i in visitor.get_imports())
+    assert all(
+        set(i) == {"start_line", "end_line", "code"} for i in visitor.get_imports()
+    )
 
 
 # ---------------------------------------------------------- top-level chunks
@@ -158,15 +160,25 @@ def test_class_without_bases_or_docstring(sample_source):
 def test_methods_know_their_class(sample_source):
     visitor, _ = visit(sample_source)
     methods = visitor.get_methods()
-    assert [m["name"] for m in methods] == ["deposit", "create", "value", "value", "sync"]
-    assert {(m["class_name"], m["class_start_line"]) for m in methods} == {("Account", 40)}
+    assert [m["name"] for m in methods] == [
+        "deposit",
+        "create",
+        "value",
+        "value",
+        "sync",
+    ]
+    assert {(m["class_name"], m["class_start_line"]) for m in methods} == {
+        ("Account", 40)
+    }
 
 
 def test_method_code_is_dedented_and_keeps_decorators(sample_source):
     visitor, _ = visit(sample_source)
     deposit = by_name(visitor.get_methods(), "deposit")[0]
     assert deposit["code"] == (
-        'def deposit(self, amount: int) -> None:\n    """Add money."""\n    self.balance += amount'
+        "def deposit(self, amount: int) -> None:\n"
+        '    """Add money."""\n'
+        "    self.balance += amount"
     )
     assert (deposit["start_line"], deposit["end_line"]) == (46, 48)
 
@@ -191,11 +203,7 @@ def test_async_method_signature(sample_source):
 
 def test_dedent_leaves_lines_less_indented_than_the_def_alone():
     source = (
-        "class A:\n"
-        "    def f(self):\n"
-        '        return """\n'
-        "unindented line\n"
-        '        """\n'
+        'class A:\n    def f(self):\n        return """\nunindented line\n        """\n'
     )
     visitor, _ = visit(source)
     (f,) = visitor.get_methods()
@@ -212,5 +220,7 @@ def test_nested_class_is_recorded_with_its_own_methods():
 
 def test_empty_source_gives_no_chunks():
     visitor, top = visit("")
-    assert visitor.get_imports() == visitor.get_classes() == visitor.get_functions() == []
+    assert (
+        visitor.get_imports() == visitor.get_classes() == visitor.get_functions() == []
+    )
     assert visitor.get_methods() == top.get_chunks() == []

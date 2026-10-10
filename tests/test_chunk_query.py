@@ -21,11 +21,15 @@ def lines_of(source: str, first: int, last: int) -> str:
 
 
 def force_outline(monkeypatch):
-    monkeypatch.setattr(chunk_query, "count_tokens", lambda t: 1 if "    ..." in t else 1000)
+    monkeypatch.setattr(
+        chunk_query, "count_tokens", lambda t: 1 if "    ..." in t else 1000
+    )
 
 
 def force_full(monkeypatch):
-    monkeypatch.setattr(chunk_query, "count_tokens", lambda t: 1000 if "    ..." in t else 1)
+    monkeypatch.setattr(
+        chunk_query, "count_tokens", lambda t: 1000 if "    ..." in t else 1
+    )
 
 
 @pytest.fixture
@@ -61,7 +65,10 @@ def test_file_without_imports_or_top_level_code(conn, tmp_path):
     empty.write_text("def f():\n    pass\n")
     save_file(conn, str(empty))
     assert get_imports(conn, str(empty)) == "`only_def.py` has no module-level imports."
-    assert get_top_level_chunks(conn, str(empty)) == "`only_def.py` has no other module-level code."
+    assert (
+        get_top_level_chunks(conn, str(empty))
+        == "`only_def.py` has no other module-level code."
+    )
     assert get_classes(conn, str(empty)) == "`only_def.py` has no classes."
 
 
@@ -80,9 +87,16 @@ def test_classes_outline_for_big_class_and_full_source_for_tiny_one(indexed, pat
     assert out.startswith("## Classes in `sample.py`")
 
     tiny, account = out.split("### class ")[1:]
-    assert tiny.startswith("`Tiny` (lines 36-37) — full source\n```python\nclass Tiny:\n    pass\n```")
+    assert tiny.startswith(
+        "`Tiny` (lines 36-37) — full source\n```python\nclass Tiny:\n    pass\n```"
+    )
     # the big class is shown as an outline: header + docstring + method names, no bodies
-    assert account.startswith("`Account` (lines 40-63)\n```python\n@dataclass\nclass Account(Base, metaclass=Meta):")
+    assert account.startswith(
+        "`Account` (lines 40-63)\n"
+        "```python\n"
+        "@dataclass\n"
+        "class Account(Base, metaclass=Meta):"
+    )
     assert '"""A bank account."""' in account
     assert "Methods: `deposit`, `create`, `value`, `sync`" in account
     assert "self.balance" not in account
@@ -112,7 +126,13 @@ def test_functions_outline(indexed, path, monkeypatch):
     force_outline(monkeypatch)
     out = get_functions(indexed, path)
     assert out.startswith("## Functions in `sample.py`")
-    assert "### function `helper` (lines 18-19)\n```python\ndef helper(a, b=2):\n    ...\n```" in out
+    assert (
+        "### function `helper` (lines 18-19)\n"
+        "```python\n"
+        "def helper(a, b=2):\n"
+        "    ...\n"
+        "```" in out
+    )
     assert "### function `fetch` (lines 22-33)" in out
     assert "@cache\nasync def fetch(" in out
     assert '    """Fetch a URL.\n\n    Retries on failure."""\n    ...' in out
@@ -135,13 +155,22 @@ def test_class_methods_signatures(indexed, path, monkeypatch):
         "### method `Account.deposit` (lines 46-48)\n```python\n"
         'def deposit(self, amount: int) -> None:\n    """Add money."""\n    ...\n```'
     ) in out
-    assert "### method `Account.sync` (lines 62-63)\n```python\nasync def sync(self):\n    ...\n```" in out
+    assert (
+        "### method `Account.sync` (lines 62-63)\n"
+        "```python\n"
+        "async def sync(self):\n"
+        "    ...\n"
+        "```" in out
+    )
     assert out.count("### method ") == 5
     assert "self.balance" not in out
 
 
 def test_class_without_methods(indexed, path):
-    assert get_class_methods(indexed, path, "Tiny") == "Class `Tiny` (lines 36-37) has no methods."
+    assert (
+        get_class_methods(indexed, path, "Tiny")
+        == "Class `Tiny` (lines 36-37) has no methods."
+    )
 
 
 # --------------------------------------------------------------------- expand
@@ -163,8 +192,12 @@ def test_class_code(indexed, path, sample_source):
 
 def test_method_code_is_dedented(indexed, path):
     assert get_method_code(indexed, path, "Account", "deposit") == (
-        "### method `Account.deposit` (lines 46-48)\n```python\n"
-        'def deposit(self, amount: int) -> None:\n    """Add money."""\n    self.balance += amount\n```'
+        "### method `Account.deposit` (lines 46-48)\n"
+        "```python\n"
+        "def deposit(self, amount: int) -> None:\n"
+        '    """Add money."""\n'
+        "    self.balance += amount\n"
+        "```"
     )
 
 
@@ -177,7 +210,13 @@ def test_method_with_getter_and_setter_returns_both(indexed, path):
 
 def test_functions_sharing_a_name_are_all_returned(conn, tmp_path):
     p = tmp_path / "overloads.py"
-    p.write_text("@overload\ndef f(x: int): ...\n\n@overload\ndef f(x: str): ...\n\ndef f(x): return x\n")
+    p.write_text(
+        "@overload\n"
+        "def f(x: int): ...\n\n"
+        "@overload\n"
+        "def f(x: str): ...\n\n"
+        "def f(x): return x\n"
+    )
     save_file(conn, str(p))
     out = get_function_code(conn, str(p), "f")
     assert out.count("### function `f`") == 3
@@ -199,7 +238,9 @@ def test_functions_sharing_a_name_are_all_returned(conn, tmp_path):
 )
 def test_unindexed_file_is_an_error(conn, tmp_path, call):
     missing = str(tmp_path / "nope.py")
-    assert call(conn, missing) == f"**Error:** File `{missing}` was not found in the index"
+    assert (
+        call(conn, missing) == f"**Error:** File `{missing}` was not found in the index"
+    )
 
 
 def test_unknown_function_lists_the_available_ones(indexed, path):
@@ -231,7 +272,9 @@ def test_file_with_no_functions_or_classes_says_so(conn, tmp_path):
     p = tmp_path / "x.py"
     p.write_text("X = 1\n")
     save_file(conn, str(p))
-    assert "This file has no top-level functions." in get_function_code(conn, str(p), "f")
+    assert "This file has no top-level functions." in get_function_code(
+        conn, str(p), "f"
+    )
     assert "This file has no classes." in get_class_code(conn, str(p), "C")
 
 
@@ -243,7 +286,9 @@ def test_long_name_lists_are_capped():
 
 
 # ------------------------------------------------------------- output format
-@pytest.mark.parametrize("name", ["get_classes", "get_functions", "get_imports", "get_top_level_chunks"])
+@pytest.mark.parametrize(
+    "name", ["get_classes", "get_functions", "get_imports", "get_top_level_chunks"]
+)
 def test_nothing_is_json(indexed, path, name):
     out = getattr(chunk_query, name)(indexed, path)
     assert not out.lstrip().startswith(("{", "["))

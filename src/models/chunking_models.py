@@ -1,5 +1,3 @@
-from typing import Optional
-
 from pydantic import BaseModel, ConfigDict
 
 
@@ -47,7 +45,7 @@ class Definition(Chunk):
 
     name: str
     signature: str  # decorators + header, e.g. "@cache\nasync def f(x: int) -> str"
-    docstring: Optional[str] = None
+    docstring: str | None = None
 
 
 class Classes(Definition):

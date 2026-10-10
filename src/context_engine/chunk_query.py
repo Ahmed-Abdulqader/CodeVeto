@@ -106,7 +106,7 @@ def _code_item(heading: str, d: Definition) -> str:
 def _fetch(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict]:
     cur = conn.execute(sql, params)
     cols = [c[0] for c in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+    return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
 
 
 def _get_file_id(conn: sqlite3.Connection, file_path: str) -> int | None:
@@ -268,9 +268,7 @@ def get_functions(conn: sqlite3.Connection, file_path: str) -> str:
     return "\n\n".join(parts)
 
 
-def get_class_methods(
-    conn: sqlite3.Connection, file_path: str, class_name: str
-) -> str:
+def get_class_methods(conn: sqlite3.Connection, file_path: str, class_name: str) -> str:
     """The methods of a class: outline (signature, docstring) or full source."""
     file_id = _get_file_id(conn, file_path)
     if file_id is None:

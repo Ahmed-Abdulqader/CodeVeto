@@ -26,10 +26,18 @@ def test_init_database_creates_only_the_tables_in_use(db_path):
         tables = {
             r[0]
             for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             )
         }
-        assert tables == {"files", "imports", "top_level_chunks", "classes", "functions", "methods"}
+        assert tables == {
+            "files",
+            "imports",
+            "top_level_chunks",
+            "classes",
+            "functions",
+            "methods",
+        }
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     conn.close()
 
@@ -37,8 +45,20 @@ def test_init_database_creates_only_the_tables_in_use(db_path):
 def test_tables_only_store_what_the_agent_uses(conn):
     definition = ["name", "signature", "docstring", "start_line", "end_line", "code"]
     assert columns(conn, "files") == ["id", "file_path", "content_hash"]
-    assert columns(conn, "imports") == ["id", "file_id", "start_line", "end_line", "code"]
-    assert columns(conn, "top_level_chunks") == ["id", "file_id", "start_line", "end_line", "code"]
+    assert columns(conn, "imports") == [
+        "id",
+        "file_id",
+        "start_line",
+        "end_line",
+        "code",
+    ]
+    assert columns(conn, "top_level_chunks") == [
+        "id",
+        "file_id",
+        "start_line",
+        "end_line",
+        "code",
+    ]
     assert columns(conn, "classes") == ["id", "file_id", *definition]
     assert columns(conn, "functions") == ["id", "file_id", *definition]
     assert columns(conn, "methods") == ["id", "class_id", "file_id", *definition]
@@ -74,7 +94,10 @@ def test_init_database_rebuilds_an_old_layout(tmp_path):
     with sqlite3.connect(old) as conn:
         assert columns(conn, "files") == ["id", "file_path", "content_hash"]
         assert count(conn, "files") == 0
-        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        names = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
         assert "class_inheritance" not in names
     conn.close()
 
@@ -101,7 +124,8 @@ def test_save_file_stores_normalized_path_and_hash(conn, sample_file, sample_sou
 def test_save_file_stores_code_signature_and_lines(conn, sample_file):
     save_file(conn, str(sample_file))
     row = conn.execute(
-        "SELECT signature, docstring, start_line, end_line, code FROM functions WHERE name = 'fetch'"
+        "SELECT signature, docstring, start_line, end_line, code "
+        "FROM functions WHERE name = 'fetch'"
     ).fetchone()
     assert row[0].startswith("@cache\nasync def fetch(")
     assert row[1] == "Fetch a URL.\n\nRetries on failure."
@@ -112,7 +136,9 @@ def test_save_file_stores_code_signature_and_lines(conn, sample_file):
 def test_methods_are_linked_to_their_class(conn, sample_file):
     save_file(conn, str(sample_file))
     rows = conn.execute(
-        "SELECT c.name, m.name FROM methods m JOIN classes c ON c.id = m.class_id ORDER BY m.start_line"
+        "SELECT c.name, m.name FROM methods m "
+        "JOIN classes c ON c.id = m.class_id "
+        "ORDER BY m.start_line"
     ).fetchall()
     assert [r[0] for r in rows] == ["Account"] * 5
     assert [r[1] for r in rows] == ["deposit", "create", "value", "value", "sync"]
@@ -171,7 +197,9 @@ def test_deleting_a_file_row_cascades_to_every_child_table(conn, sample_file):
         assert count(conn, table) == 0
 
 
-def test_relative_and_symlinked_paths_hit_the_same_row(conn, sample_file, tmp_path, monkeypatch):
+def test_relative_and_symlinked_paths_hit_the_same_row(
+    conn, sample_file, tmp_path, monkeypatch
+):
     link = tmp_path / "link.py"
     os.symlink(sample_file, link)
     monkeypatch.chdir(tmp_path)

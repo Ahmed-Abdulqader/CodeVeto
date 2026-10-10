@@ -90,7 +90,8 @@ if __name__ == "__main__":
 
 @pytest.fixture(autouse=True)
 def offline_tokenizer(monkeypatch):
-    """Never touch tiktoken (it downloads its vocabulary): use the ~4 chars/token fallback."""
+    """Never touch tiktoken (it downloads its vocabulary):
+    use the ~4 chars/token fallback."""
     monkeypatch.setattr(chunk_query, "_encoder", lambda: None)
 
 

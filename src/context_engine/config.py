@@ -1,4 +1,4 @@
-#constants 
+# constants
 import pathlib
 
 
@@ -7,6 +7,7 @@ def _database():
     database.parent.mkdir(parents=True, exist_ok=True)
     database.touch(exist_ok=True)
     return database
+
 
 HOME_DIR = pathlib.Path.home() / ".codeveto"
 DATABASE_PATH = _database()

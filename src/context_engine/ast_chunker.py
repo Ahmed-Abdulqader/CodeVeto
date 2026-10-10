@@ -56,7 +56,7 @@ def _dedent(lines: list[str]) -> str:
     first = lines[0]
     prefix = first[: len(first) - len(first.lstrip())]
     return "\n".join(
-        line[len(prefix):] if line.startswith(prefix) else line for line in lines
+        line[len(prefix) :] if line.startswith(prefix) else line for line in lines
     )
 
 
